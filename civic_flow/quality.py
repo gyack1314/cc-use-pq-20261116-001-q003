@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from datetime import datetime
 
+from .clock import PolicyBook, cycle_dues
 from .contracts import DomainError, utc
 from .metrics import MetricsService
 from .store import Store
@@ -24,12 +25,19 @@ class QualityService:
         stamp = utc(as_of)
         with self.store.transaction() as db:
             watermark = self.store.watermark(db)
+            book = PolicyBook.load(db, watermark)
             batches = [dict(row) for row in db.execute("SELECT * FROM batches ORDER BY batch_key")]
             cases = [dict(row) for row in db.execute("SELECT * FROM cases ORDER BY case_id")]
             events = [dict(row) for row in db.execute("SELECT * FROM events ORDER BY event_id")]
             reports = [dict(row) for row in db.execute("SELECT * FROM reports ORDER BY report_key")]
             for case in cases:
                 key = str(case["case_id"])
+                case_events = [row for row in events if row["case_id"] == case["case_id"]]
+                dues = cycle_dues(case, case_events, book)
+                if (dues["response_due"] != case["response_due"]
+                        or dues["resolution_due"] != case["resolution_due"]):
+                    issues.append(self._issue("CLOCK_DRIFT", "case", key,
+                                              "Stored deadlines differ from service clock"))
                 if case["accepted_at"] > case["last_event_at"]:
                     issues.append(self._issue("TIME_REVERSED", "case", key,
                                               "Last event predates acceptance"))
@@ -45,7 +53,6 @@ class QualityService:
                 if case["status"] != "closed" and case["resolution"]:
                     issues.append(self._issue("OPEN_WITH_RESOLUTION", "case", key,
                                               "Open case retains closure value"))
-                case_events = [row for row in events if row["case_id"] == case["case_id"]]
                 if len(case_events) + 1 != case["version"]:
                     issues.append(self._issue("VERSION_GAP", "case", key,
                                               "Event count differs from current version"))

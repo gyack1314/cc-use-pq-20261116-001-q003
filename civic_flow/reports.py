@@ -61,7 +61,8 @@ class ReportService:
             a = json.loads(first["body_json"])
             b = json.loads(second["body_json"])
             keys = ("accepted", "open", "responded", "response_overdue", "resolution_overdue",
-                    "closed", "solved", "explained_close", "acknowledged", "reopened")
+                    "closed", "solved", "explained_close", "acknowledged", "reopened",
+                    "cycles_total", "cycles_response_late", "cycles_resolution_late")
             deltas = {key: b["totals"][key] - a["totals"][key] for key in keys}
             ga = {group["key"]: group for group in a["groups"]}
             gb = {group["key"]: group for group in b["groups"]}

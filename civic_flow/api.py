@@ -9,7 +9,9 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
 from .cases import CaseService
-from .contracts import (BatchInput, DomainError, EventInput, GridInput,
+from .calendars import CalendarService
+from .clock import ClockService
+from .contracts import (BatchInput, CalendarInput, DomainError, EventInput, GridInput,
                         ReportInput, RouteRuleInput)
 from .ingest import IntakeService
 from .metrics import MetricsService
@@ -39,6 +41,8 @@ def create_app(path: str | Path | None = None) -> FastAPI:
     catalog = CatalogService(store)
     briefing = BriefingService(store)
     screening = ScreeningService(store)
+    calendars = CalendarService(store)
+    clocks = ClockService(store)
     app = FastAPI(title="Civic Flow", version="1.0.0")
     app.state.store = store
 
@@ -76,6 +80,24 @@ def create_app(path: str | Path | None = None) -> FastAPI:
     @app.get("/policies/{kind}/{key}/history")
     def policy_history(kind: str, key: str):
         return {"items": routes.history(kind, key)}
+
+    @app.put("/calendars/{calendar_id}")
+    def put_calendar(calendar_id: str, body: CalendarInput, actor: str = Query(min_length=1)):
+        if calendar_id != body.calendar_id:
+            raise DomainError("CALENDAR_ID_MISMATCH", "Calendar path and body differ")
+        return calendars.put(body, actor, datetime.now(timezone.utc))
+
+    @app.get("/calendars")
+    def list_calendars():
+        return calendars.list()
+
+    @app.get("/calendars/{calendar_id}/versions")
+    def calendar_versions(calendar_id: str):
+        return calendars.versions(calendar_id)
+
+    @app.get("/routes/{category}/versions")
+    def route_versions(category: str):
+        return {"items": routes.rule_versions(category)}
 
     @app.post("/batches")
     def import_batch(body: BatchInput):
@@ -121,6 +143,17 @@ def create_app(path: str | Path | None = None) -> FastAPI:
     @app.get("/cases/{case_id}/at")
     def case_at(case_id: int, as_of: datetime):
         return metrics.case_at(case_id, as_of)
+
+    @app.get("/cases/{case_id}/clock")
+    def case_clock(case_id: int, as_of: datetime | None = None):
+        return clocks.case_clock(case_id, as_of)
+
+    @app.get("/cases/{case_id}/clock/intervals")
+    def case_clock_intervals(case_id: int, commitment: str = "response",
+                             cycle: int | None = None, limit: int = 200,
+                             as_of: datetime | None = None):
+        return clocks.case_intervals(case_id, commitment=commitment, cycle=cycle,
+                                     limit=limit, as_of=as_of)
 
     @app.get("/audit")
     def audit(after: int = 0, limit: int = 100):

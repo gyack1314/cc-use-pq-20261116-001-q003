@@ -69,10 +69,71 @@ def run() -> dict:
         check = required(client.get("/reports/after/verify"))
         if not check["matches"]:
             raise RuntimeError("Frozen report verification failed")
+        clocked = run_service_clock(client)
         return {"accepted": imported["imported_count"],
                 "closed_as_of_later_report": after["body"]["totals"]["closed"],
                 "historic_closed": before["body"]["totals"]["closed"],
-                "quality_issues": quality["issue_count"], "report_verified": check["matches"]}
+                "quality_issues": quality["issue_count"], "report_verified": check["matches"],
+                **clocked}
+
+def run_service_clock(client) -> dict:
+    """带生效时间的工作日历：跨周末期限、补录重判与归档报表还原。"""
+    weekdays = {day: [["09:00", "17:00"]] for day in
+                ("mon", "tue", "wed", "thu", "fri")}
+    required(client.put("/calendars/city?actor=analyst", json={
+        "calendar_id": "city", "effective_from": "2026-01-01T00:00:00Z",
+        "utc_offset": "+00:00", "workweek": weekdays, "holidays": []}))
+    required(client.put("/routes/traffic?actor=analyst", json={
+        "category": "traffic", "department": "roads", "priority": 4,
+        "response_hours": 8, "resolution_hours": 16,
+        "response_kind": "working", "resolution_kind": "working",
+        "calendar_id": "city"}))
+    # 2026-01-02 是周五 15:00：周五 2h + 周一 6h → 期限跳过周末
+    required(client.post("/batches", json={
+        "batch_key": "demo-clock", "submitted_at": "2026-01-03T00:00:00Z",
+        "cases": [{"external_id": "t-1", "grid_id": "g-1", "category": "traffic",
+                   "summary": "Signal timing is unsafe", "priority": 2,
+                   "occurred_at": "2026-01-02T15:00:00Z",
+                   "resident_token": "synthetic-person-3"}]}))
+    clocked_id = [item["case_id"] for item in required(client.get("/cases"))["items"]
+                  if item["external_id"] == "t-1"][0]
+    view = required(client.get(f"/cases/{clocked_id}/clock",
+                               params={"as_of": "2026-01-03T00:00:00Z"}))
+    due = view["cycles"][0]["response"]["due"]
+    if due != "2026-01-05T15:00:00+00:00":
+        raise RuntimeError("Working clock did not skip the weekend: " + due)
+    frozen = required(client.post("/reports", json={
+        "report_key": "clock-frozen", "as_of": "2026-01-05T16:00:00Z",
+        "group_by": "district", "category": "traffic"}))
+    if frozen["body"]["totals"]["response_overdue"] != 1:
+        raise RuntimeError("Frozen report should mark the missed working deadline")
+    # 日历补录：周一 2026-01-05 为节假日，生效时间早于受理时刻
+    backfill = required(client.put("/calendars/city?actor=analyst", json={
+        "calendar_id": "city", "effective_from": "2026-01-01T00:00:00Z",
+        "utc_offset": "+00:00", "workweek": weekdays,
+        "holidays": ["2026-01-05"]}))
+    if backfill["reevaluated_cases"] != [clocked_id]:
+        raise RuntimeError("Calendar backfill did not re-evaluate the open cycle")
+    queue = required(client.get("/operations/queue",
+                                params={"as_of": "2026-01-05T16:00:00Z"}))
+    item = [row for row in queue["items"] if row["case_id"] == clocked_id][0]
+    if item["response_due"] != "2026-01-06T15:00:00+00:00" or item["response_overdue"]:
+        raise RuntimeError("Queue did not adopt the re-evaluated service clock")
+    live = required(client.get("/metrics", params={"as_of": "2026-01-05T16:00:00Z",
+                                                   "include_cases": True}))
+    matched = [row for row in live["cases"] if row["case_id"] == clocked_id][0]
+    if matched["flags"]["response_overdue"] != item["response_overdue"]:
+        raise RuntimeError("Queue and statistics disagree after calendar backfill")
+    if not required(client.get("/reports/clock-frozen/verify"))["matches"]:
+        raise RuntimeError("Archived report failed to restore the original policy")
+    quality = required(client.get("/quality/inspect",
+                                  params={"as_of": "2026-01-06T00:00:00Z"}))
+    if quality["issue_count"]:
+        raise RuntimeError("Service clock drift detected after backfill")
+    return {"clock_cycle": view["current_cycle"],
+            "clock_due_before_backfill": due,
+            "clock_due_after_backfill": item["response_due"],
+            "archived_report_verified": True}
 
 if __name__ == "__main__":
     print(json.dumps(run(), ensure_ascii=False, sort_keys=True))

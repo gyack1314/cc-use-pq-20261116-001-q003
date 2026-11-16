@@ -35,11 +35,15 @@ class OperationsService:
                                 "grid_id": base["grid_id"], "district": base["district"],
                                 "category": base["category"], "department": item["department"],
                                 "priority": base["priority"], "status": item["status"],
+                                "cycle": item["cycle"],
                                 "accepted_at": base["accepted_at"],
-                                "response_due": base["response_due"],
-                                "resolution_due": base["resolution_due"],
+                                "response_due": item["response_due"],
+                                "resolution_due": item["resolution_due"],
+                                "response_remaining_hours": item["response_remaining_hours"],
+                                "resolution_remaining_hours": item["resolution_remaining_hours"],
                                 "response_overdue": item["flags"]["response_overdue"],
-                                "resolution_overdue": item["flags"]["resolution_overdue"]})
+                                "resolution_overdue": item["flags"]["resolution_overdue"],
+                                "overdue_reasons": item["breaches"]})
             selected = details[:limit]
             return {"as_of": timestamp, "watermark": snapshot["watermark"],
                     "items": selected, "next_cursor": selected[-1]["case_id"] if selected else None,

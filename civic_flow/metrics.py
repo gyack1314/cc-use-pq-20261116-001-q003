@@ -5,7 +5,8 @@ from collections import defaultdict
 from datetime import datetime
 from typing import Iterable
 
-from .contracts import DomainError, parse_time, utc
+from .clock import PolicyBook, evaluate_case
+from .contracts import DomainError, utc
 from .store import Store
 
 def reconstruct(base: dict, events: Iterable[dict], as_of: str) -> dict:
@@ -50,19 +51,15 @@ def reconstruct(base: dict, events: Iterable[dict], as_of: str) -> dict:
             raise DomainError("CORRUPT_EVENT", "Unknown stored event kind", 500)
     return item
 
-def derived(case: dict, as_of: str) -> dict:
-    response_due = case["response_due"]
-    resolution_due = case["resolution_due"]
-    response_at = case["first_response_at"]
-    responded = response_at is not None
+def flags_for(case: dict, evaluation: dict) -> dict:
+    """组合状态重建与服务时钟评估，得到统一的逾期判断。"""
+    clock = evaluation["flags"]
     closed = case["status"] == "closed"
     return {
-        "response_on_time": responded and response_at <= response_due,
-        "response_overdue": (not responded and as_of > response_due) or
-                            (responded and response_at > response_due),
-        "resolution_overdue": (not closed and as_of > resolution_due) or
-                              (closed and case["last_event_at"] > resolution_due),
-        "responded": responded,
+        "response_on_time": clock["response_on_time"],
+        "response_overdue": clock["response_overdue"],
+        "resolution_overdue": clock["resolution_overdue"],
+        "responded": case["first_response_at"] is not None,
         "closed": closed,
         "solved": closed and case["resolution"] == "solved",
         "explained_close": closed and case["resolution"] == "explained",
@@ -70,12 +67,16 @@ def derived(case: dict, as_of: str) -> dict:
         "acknowledged": case["acknowledged"],
         "reopened": case["reopen_count"] > 0,
         "explained": case["explanation_count"] > 0,
+        "cycles": clock["cycles"],
+        "cycles_response_late": clock["cycles_response_late"],
+        "cycles_resolution_late": clock["cycles_resolution_late"],
     }
 
 COUNTERS = (
     "accepted", "open", "responded", "response_on_time", "response_overdue",
     "resolution_overdue", "closed", "solved", "explained_close", "out_of_scope",
     "acknowledged", "reopened", "explained", "priority_one",
+    "cycles_total", "cycles_response_late", "cycles_resolution_late",
 )
 
 def empty_counters() -> dict[str, int]:
@@ -89,6 +90,9 @@ def accrue(counters: dict, case: dict, flags: dict) -> None:
                   "out_of_scope", "acknowledged", "reopened", "explained"):
         counters[field] += int(flags[field])
     counters["priority_one"] += int(case["priority"] == 1)
+    counters["cycles_total"] += flags["cycles"]
+    counters["cycles_response_late"] += flags["cycles_response_late"]
+    counters["cycles_resolution_late"] += flags["cycles_resolution_late"]
 
 def ratios(counters: dict) -> dict:
     accepted = counters["accepted"]
@@ -121,6 +125,7 @@ class MetricsService:
             raise DomainError("BAD_GROUP", "Unsupported grouping")
         if watermark is None:
             watermark = self.store.watermark(db)
+        book = PolicyBook.load(db, watermark)
         filters = ["created_sequence<=?", "accepted_at<=?"]
         params: list[object] = [watermark, stamp]
         if district is not None:
@@ -137,13 +142,24 @@ class MetricsService:
         for base in rows:
             events = self.store.events(db, base["case_id"], watermark)
             case = reconstruct(base, events, stamp)
-            flags = derived(case, stamp)
+            evaluation = evaluate_case(base, events, stamp, book)
+            flags = flags_for(case, evaluation)
             accrue(totals, case, flags)
             accrue(grouped[self._group(case, group_by)], case, flags)
             if include_cases:
+                current = evaluation["current"]
                 details.append({"case_id": case["case_id"], "status": case["status"],
                                 "version": case["version"], "department": case["department"],
-                                "district": case["district"], "flags": flags})
+                                "district": case["district"],
+                                "cycle": current["cycle"],
+                                "response_due": current["response"]["due"],
+                                "resolution_due": current["resolution"]["due"],
+                                "response_remaining_hours":
+                                    current["response"]["remaining_hours"],
+                                "resolution_remaining_hours":
+                                    current["resolution"]["remaining_hours"],
+                                "breaches": current["breaches"],
+                                "flags": flags})
         return {
             "as_of": stamp, "watermark": watermark, "group_by": group_by,
             "filters": {"district": district, "category": category},
@@ -167,7 +183,12 @@ class MetricsService:
             if base["accepted_at"] > stamp:
                 raise DomainError("CASE_NOT_YET_ACCEPTED", "Case was not accepted at time", 404)
             watermark = self.store.watermark(db)
-            current = reconstruct(base, self.store.events(db, case_id, watermark), stamp)
-            current["indicators"] = derived(current, stamp)
+            events = self.store.events(db, case_id, watermark)
+            book = PolicyBook.load(db, watermark)
+            evaluation = evaluate_case(base, events, stamp, book)
+            current = reconstruct(base, events, stamp)
+            current["indicators"] = flags_for(current, evaluation)
+            current["clock"] = {"cycles": evaluation["cycles"],
+                                "responsibility": evaluation["responsibility"]}
             current["watermark"] = watermark
             return current

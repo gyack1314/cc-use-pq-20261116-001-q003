@@ -19,7 +19,27 @@ CREATE TABLE IF NOT EXISTS grids (
 CREATE TABLE IF NOT EXISTS route_rules (
     category TEXT PRIMARY KEY, department TEXT NOT NULL, priority INTEGER NOT NULL,
     response_hours INTEGER NOT NULL, resolution_hours INTEGER NOT NULL,
+    response_kind TEXT NOT NULL DEFAULT 'natural',
+    resolution_kind TEXT NOT NULL DEFAULT 'natural',
+    calendar_id TEXT, effective_from TEXT,
     revision INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS route_rule_versions (
+    category TEXT NOT NULL, revision INTEGER NOT NULL,
+    department TEXT NOT NULL, priority INTEGER NOT NULL,
+    response_hours INTEGER NOT NULL, resolution_hours INTEGER NOT NULL,
+    response_kind TEXT NOT NULL, resolution_kind TEXT NOT NULL,
+    calendar_id TEXT, effective_from TEXT NOT NULL, sequence INTEGER NOT NULL,
+    PRIMARY KEY(category, revision)
+);
+CREATE TABLE IF NOT EXISTS calendars (
+    calendar_id TEXT PRIMARY KEY, revision INTEGER NOT NULL,
+    effective_from TEXT NOT NULL, spec_json TEXT NOT NULL, sequence INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS calendar_versions (
+    calendar_id TEXT NOT NULL, revision INTEGER NOT NULL,
+    effective_from TEXT NOT NULL, spec_json TEXT NOT NULL, sequence INTEGER NOT NULL,
+    PRIMARY KEY(calendar_id, revision)
 );
 CREATE TABLE IF NOT EXISTS batches (
     batch_key TEXT PRIMARY KEY, digest TEXT NOT NULL, submitted_at TEXT NOT NULL,
@@ -37,6 +57,7 @@ CREATE TABLE IF NOT EXISTS cases (
     status TEXT NOT NULL, resolution TEXT,
     first_response_at TEXT, last_event_at TEXT NOT NULL,
     version INTEGER NOT NULL DEFAULT 1, created_sequence INTEGER NOT NULL,
+    cycle INTEGER NOT NULL DEFAULT 1, cycle_started_at TEXT,
     UNIQUE(source, external_id)
 );
 CREATE INDEX IF NOT EXISTS cases_grid_status ON cases(grid_id,status);
@@ -84,6 +105,38 @@ class Store:
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self.connection() as db:
             db.executescript(SCHEMA)
+            self._migrate(db)
+
+    @staticmethod
+    def _migrate(db: sqlite3.Connection) -> None:
+        def columns(table: str) -> set[str]:
+            return {row[1] for row in db.execute("PRAGMA table_info(" + table + ")")}
+
+        case_columns = columns("cases")
+        if "cycle" not in case_columns:
+            db.execute("ALTER TABLE cases ADD COLUMN cycle INTEGER NOT NULL DEFAULT 1")
+        if "cycle_started_at" not in case_columns:
+            db.execute("ALTER TABLE cases ADD COLUMN cycle_started_at TEXT")
+            db.execute("UPDATE cases SET cycle_started_at=accepted_at "
+                       "WHERE cycle_started_at IS NULL")
+        rule_columns = columns("route_rules")
+        for name, ddl in (("response_kind", "TEXT NOT NULL DEFAULT 'natural'"),
+                          ("resolution_kind", "TEXT NOT NULL DEFAULT 'natural'"),
+                          ("calendar_id", "TEXT"), ("effective_from", "TEXT")):
+            if name not in rule_columns:
+                db.execute("ALTER TABLE route_rules ADD COLUMN " + name + " " + ddl)
+        for rule in db.execute("SELECT * FROM route_rules").fetchall():
+            exists = db.execute("SELECT 1 FROM route_rule_versions WHERE category=?",
+                                (rule["category"],)).fetchone()
+            if not exists:
+                db.execute(
+                    "INSERT INTO route_rule_versions(category,revision,department,priority,"
+                    "response_hours,resolution_hours,response_kind,resolution_kind,"
+                    "calendar_id,effective_from,sequence) VALUES(?,?,?,?,?,?,?,?,?,?,0)",
+                    (rule["category"], rule["revision"], rule["department"], rule["priority"],
+                     rule["response_hours"], rule["resolution_hours"], rule["response_kind"],
+                     rule["resolution_kind"], rule["calendar_id"],
+                     rule["effective_from"] or "1970-01-01T00:00:00+00:00"))
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
@@ -130,6 +183,37 @@ class Store:
     @staticmethod
     def rule(db: sqlite3.Connection, category: str) -> dict | None:
         return row(db.execute("SELECT * FROM route_rules WHERE category=?", (category,)).fetchone())
+
+    @staticmethod
+    def rule_versions(db: sqlite3.Connection, watermark: int | None = None) -> list[dict]:
+        sql = "SELECT * FROM route_rule_versions"
+        params: tuple = ()
+        if watermark is not None:
+            sql += " WHERE sequence<=?"
+            params = (watermark,)
+        sql += " ORDER BY category,effective_from,revision"
+        return [dict(item) for item in db.execute(sql, params)]
+
+    @staticmethod
+    def calendar(db: sqlite3.Connection, calendar_id: str) -> dict | None:
+        return row(db.execute("SELECT * FROM calendars WHERE calendar_id=?",
+                              (calendar_id,)).fetchone())
+
+    @staticmethod
+    def calendar_versions(db: sqlite3.Connection, calendar_id: str | None = None,
+                          watermark: int | None = None) -> list[dict]:
+        clauses, params = [], []
+        if calendar_id is not None:
+            clauses.append("calendar_id=?")
+            params.append(calendar_id)
+        if watermark is not None:
+            clauses.append("sequence<=?")
+            params.append(watermark)
+        sql = "SELECT * FROM calendar_versions"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY calendar_id,effective_from,revision"
+        return [dict(item) for item in db.execute(sql, params)]
 
     @staticmethod
     def case(db: sqlite3.Connection, case_id: int) -> dict:

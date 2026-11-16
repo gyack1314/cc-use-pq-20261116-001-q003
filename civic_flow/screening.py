@@ -35,6 +35,12 @@ class ScreeningService:
                 if self.store.rule(db, case.category) is None:
                     issues.append({"index": index, "code": "ROUTE_UNKNOWN",
                                    "category": case.category})
+                else:
+                    rule = self.store.rule(db, case.category)
+                    if ("working" in (rule["response_kind"], rule["resolution_kind"])
+                            and self.store.calendar(db, rule["calendar_id"] or "") is None):
+                        issues.append({"index": index, "code": "CALENDAR_UNKNOWN",
+                                       "calendar_id": rule["calendar_id"]})
                 if utc(case.occurred_at) > utc(batch.submitted_at):
                     issues.append({"index": index, "code": "FUTURE_CASE"})
             return {"batch_key": batch.batch_key, "case_count": len(batch.cases),

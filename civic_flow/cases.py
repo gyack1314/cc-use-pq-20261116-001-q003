@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from .clock import PolicyBook, cycle_dues
 from .contracts import DomainError, EventInput, EventKind, utc
 from .store import Store, digest
 
@@ -72,6 +73,16 @@ class CaseService:
                         utc(event.occurred_at), event.department, event.note,
                         event.resolution.value if event.resolution else None,
                         version, sequence, fingerprint))
+            if event.kind == EventKind.REOPEN:
+                # 结案后重开：开启可区分的新服务周期，按重开时刻生效的政策版本计算新时限；
+                # 上一周期的迟延与回应保留在事件历史与周期评估中。
+                book = PolicyBook.load(db)
+                events = self.store.events(db, case_id)
+                dues = cycle_dues(case, events, book)
+                changes["response_due"] = dues["response_due"]
+                changes["resolution_due"] = dues["resolution_due"]
+                changes["cycle"] = dues["cycle"]
+                changes["cycle_started_at"] = dues["started_at"]
             changes["version"] = version
             changes["last_event_at"] = utc(event.occurred_at)
             fields = list(changes)

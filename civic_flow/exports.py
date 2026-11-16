@@ -13,6 +13,7 @@ CASE_COLUMNS = (
     "case_id", "source", "external_id", "grid_id", "district", "category",
     "priority", "accepted_at", "department", "status", "resolution",
     "first_response_at", "response_due", "resolution_due", "version",
+    "cycle", "cycle_started_at",
 )
 
 class ExportService:

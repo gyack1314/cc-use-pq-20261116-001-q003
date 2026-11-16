@@ -5,6 +5,7 @@ import hashlib
 import sqlite3
 from datetime import datetime, timezone
 
+from .clock import PolicyBook
 from .contracts import BatchInput, DomainError, utc
 from .routing import RoutingService
 from .store import Store, digest
@@ -43,12 +44,14 @@ class IntakeService:
                 if prior["digest"] != fingerprint:
                     raise DomainError("BATCH_KEY_CONFLICT", "Batch key has different content", 409)
                 return {**prior, "replayed": True}
+            book = PolicyBook.load(db)
             for case in batch.cases:
                 old = self.store.case_by_external(db, case.source, case.external_id)
                 if old is not None:
                     raise DomainError("CASE_ID_CONFLICT", "Source identity already imported", 409,
                                       {"source": case.source, "external_id": case.external_id})
-                route = RoutingService.resolve(db, case.grid_id, case.category, case.occurred_at)
+                route = RoutingService.resolve(db, case.grid_id, case.category,
+                                               case.occurred_at, book)
                 event_payload = self._case_payload(case)
                 sequence = self.store.journal(db, "case_accepted", "case",
                                               case.source + ":" + case.external_id,
@@ -56,12 +59,13 @@ class IntakeService:
                 db.execute("INSERT INTO cases(source,external_id,grid_id,district,category,summary,"
                            "resident_hash,priority,accepted_at,department,initial_department,route_revision,response_due,"
                            "resolution_due,status,resolution,first_response_at,last_event_at,version,"
-                           "created_sequence) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                           "created_sequence,cycle,cycle_started_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                            (case.source, case.external_id, route.grid_id, route.district,
                             route.category, case.summary, self._resident_hash(case.resident_token),
                             case.priority, utc(case.occurred_at), route.department, route.department,
                             route.route_revision, route.response_due, route.resolution_due,
-                            "accepted", None, None, utc(case.occurred_at), 1, sequence))
+                            "accepted", None, None, utc(case.occurred_at), 1, sequence, 1,
+                            utc(case.occurred_at)))
             first = db.execute("SELECT MIN(created_sequence) FROM cases WHERE "
                                "created_sequence > (SELECT COALESCE(MAX(sequence_end),0) FROM batches)").fetchone()[0]
             last = self.store.watermark(db)
